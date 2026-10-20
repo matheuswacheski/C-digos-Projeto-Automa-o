@@ -3,9 +3,15 @@
 // ==========================================
 // DEFINIÇÕES DE PINOS
 // ==========================================
-#define PINO_ZMPT101B A0
-#define PINO_ACS712 A1
+// Sensores da Rede Principal
+#define PINO_ZMPT_PRINCIPAL A0
+#define PINO_ACS_PRINCIPAL A1
 
+// Sensores da Rede Reserva
+#define PINO_ZMPT_RESERVA A2
+#define PINO_ACS_RESERVA A3
+
+// Relés/Contatores
 #define PINO_REDE_PRINCIPAL 2
 #define PINO_REDE_RESERVA 3
 #define PINO_REDE_EMERGENCIA 4
@@ -37,8 +43,8 @@ bool bloqueio_reserva = false;
 // ==========================================
 // PROTÓTIPOS DAS FUNÇÕES
 // ==========================================
-float lerCorrenteRMS();
-float lerTensaoRMS();
+float lerCorrenteRMS(int pino);
+float lerTensaoRMS(int pino);
 void manobraRede(TipoRede nova_rede);
 void processarFalha();
 void verificarComandosESP();
@@ -47,7 +53,7 @@ void verificarComandosESP();
 // SETUP
 // ==========================================
 void setup() {
-  Serial.begin(9600); // Comunicação com o ESP32 (Pinos TX/RX nativos)
+  Serial.begin(9600); // Comunicação com o ESP32
   
   pinMode(PINO_REDE_PRINCIPAL, OUTPUT);
   pinMode(PINO_REDE_RESERVA, OUTPUT);
@@ -68,16 +74,29 @@ void setup() {
 void loop() {
   verificarComandosESP();
 
-  float tensao = lerTensaoRMS();
-  float corrente = lerCorrenteRMS();
+  float tensao = 0.0;
+  float corrente = 0.0;
+  bool monitorar = false;
 
-  bool anomalia = (tensao > TENSAO_MAX) || (tensao < TENSAO_MIN) || (corrente > CORRENTE_MAX);
+  // Seleciona quais sensores ler dependendo da rede conectada
+  if (rede_atual == PRINCIPAL) {
+    tensao = lerTensaoRMS(PINO_ZMPT_PRINCIPAL);
+    corrente = lerCorrenteRMS(PINO_ACS_PRINCIPAL);
+    monitorar = true;
+  } 
+  else if (rede_atual == RESERVA) {
+    tensao = lerTensaoRMS(PINO_ZMPT_RESERVA);
+    corrente = lerCorrenteRMS(PINO_ACS_RESERVA);
+    monitorar = true;
+  }
+  // Se estiver na rede de EMERGÊNCIA, não há sensores definidos, apenas aguarda reparos.
 
-  if (anomalia) {
-    processarFalha();
-  } else {
-    // Se a rede estabilizar por um tempo, poderíamos zerar as falhas aqui.
-    // Para simplificar, o reset das falhas ocorrerá via comando do SOD.
+  if (monitorar) {
+    bool anomalia = (tensao > TENSAO_MAX) || (tensao < TENSAO_MIN) || (corrente > CORRENTE_MAX);
+
+    if (anomalia) {
+      processarFalha();
+    }
   }
 }
 
@@ -87,7 +106,7 @@ void loop() {
 void processarFalha() {
   falhas_consecutivas++;
   
-  // ABRIR TRIPSAVER DA REDE ATUAL (Trip)
+  // ABRIR TRIPSAVER DA REDE ATUAL (Trip) - Interrompe todas por segurança
   digitalWrite(PINO_REDE_PRINCIPAL, LOW);
   digitalWrite(PINO_REDE_RESERVA, LOW);
   digitalWrite(PINO_REDE_EMERGENCIA, LOW);
@@ -99,7 +118,7 @@ void processarFalha() {
   } 
   else {
     // Falha definitiva após 3 tentativas
-    falhas_consecutivas = 0; // Zera para a próxima rede
+    falhas_consecutivas = 0; // Zera contagem para a próxima rede assumir limpa
 
     if (rede_atual == PRINCIPAL && !bloqueio_principal) {
       bloqueio_principal = true;
@@ -146,22 +165,26 @@ void manobraRede(TipoRede nova_rede) {
 // ==========================================
 void verificarComandosESP() {
   if (Serial.available() > 0) {
-    String comando = Serial.readStringUntil(']'); // Lê até o fechamento do colchete
-    comando += ']'; // Readiciona o colchete final
+    String comando = Serial.readStringUntil(']'); 
+    comando += ']'; 
 
     if (comando.indexOf("[RP]") >= 0) {
-      // Restaura Rede Principal
-      bloqueio_principal = false;
+      bloqueio_principal = false; // Confirmação de manutenção da Principal
+    } 
+    if (comando.indexOf("[RR]") >= 0) {
+      bloqueio_reserva = false; // Confirmação de manutenção da Reserva
+    }
+
+    // REGRA DE RETORNO: 
+    // Só volta para a Principal se AMBAS as redes (Principal e Reserva) estiverem sem bloqueio (manutenidas).
+    if (!bloqueio_principal && !bloqueio_reserva && rede_atual != PRINCIPAL) {
       falhas_consecutivas = 0;
       manobraRede(PRINCIPAL);
     } 
-    else if (comando.indexOf("[RR]") >= 0) {
-      // Restaura Rede Reserva (se a principal ainda estiver bloqueada)
-      if (bloqueio_principal) {
-        bloqueio_reserva = false;
-        falhas_consecutivas = 0;
-        manobraRede(RESERVA);
-      }
+    // Caso a reserva tenha sido manutenida, mas a principal ainda não, e o sistema esteja na Emergência:
+    else if (!bloqueio_reserva && bloqueio_principal && rede_atual == EMERGENCIA) {
+      falhas_consecutivas = 0;
+      manobraRede(RESERVA);
     }
   }
 }
@@ -169,46 +192,38 @@ void verificarComandosESP() {
 // ==========================================
 // FUNÇÕES DOS SENSORES (TRUE RMS)
 // ==========================================
-/*
-  Lê os valores AC capturando o pico máximo e mínimo 
-  durante ~1 ciclo e meio da rede (25ms para 60Hz).
-*/
-float lerCorrenteRMS() {
+float lerCorrenteRMS(int pino) {
   uint32_t start_time = millis();
   int max_val = 0;
   int min_val = 1023;
   
   while (millis() - start_time < 25) {
-    int val = analogRead(PINO_ACS712);
+    int val = analogRead(pino);
     if (val > max_val) max_val = val;
     if (val < min_val) min_val = val;
   }
   
-  // Converte leitura analógica para Tensão Pico a Pico (5V / 1023)
   float tensao_pp = (max_val - min_val) * (5.0 / 1023.0);
   float tensao_rms = (tensao_pp / 2.0) * 0.707;
   float corrente_rms = tensao_rms / ACS_SENSIBILIDADE;
   
-  // Filtra ruído em zero
   if (corrente_rms < 0.05) corrente_rms = 0; 
   return corrente_rms;
 }
 
-float lerTensaoRMS() {
+float lerTensaoRMS(int pino) {
   uint32_t start_time = millis();
   int max_val = 0;
   int min_val = 1023;
   
   while (millis() - start_time < 25) {
-    int val = analogRead(PINO_ZMPT101B);
+    int val = analogRead(pino);
     if (val > max_val) max_val = val;
     if (val < min_val) min_val = val;
   }
   
   float tensao_pp = (max_val - min_val) * (5.0 / 1023.0);
   float tensao_rms_sensor = (tensao_pp / 2.0) * 0.707;
-  
-  // Multiplica pelo fator empírico do trimpot do ZMPT101B
   float tensao_final_rms = tensao_rms_sensor * ZMPT_FATOR; 
   
   if(tensao_final_rms < 10.0) tensao_final_rms = 0;
